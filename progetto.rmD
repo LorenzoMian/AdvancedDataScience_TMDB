@@ -1,0 +1,1100 @@
+---
+title: "Il mondo del cinema - Progetto ADS"
+author: "Lorenzo Mian"
+date: "2025-01-20"
+output:
+  ioslides_presentation: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(tidyverse)
+library(ggplot2)
+library(jsonlite)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(knitr)
+library(glue)
+library(kableExtra)
+library(gridExtra)
+
+my_pink <- rgb(240, 130, 254, maxColorValue = 255)
+my_azure <- rgb(106, 210, 250, maxColorValue = 255)
+
+# il dataset si puo trovare al seguente link https://www.kaggle.com/datasets/tmdb/tmdb-movie-metadata/data?select=tmdb_5000_credits.csv
+```
+
+```{r funzioni, include=FALSE} 
+# Definisco funzioni utili all'analisi dei dati
+
+# Collega una tabella ai relativi film e restituisce una tabella contenente il 
+# numero di attori/attrici per tutti i film di una certo periodo di tempo. 
+# - data: tabella contenente gender(1,2), movie_id 
+# - years: intervallo di tempo per cui dividere considerare 
+# - perc: se vero indica che occorre cacolare la percentuale
+
+gender_for_year <- function(data, years, perc) {
+  data = data %>%
+    filter(gender != 0) %>%
+    count(movie_id, gender) %>%
+    inner_join(movies, by = c("movie_id" = "id")) %>%
+    mutate(year = format(as.Date(release_date), "%Y"),
+           span_time = floor(as.numeric(year) / years) * years) %>%
+    group_by(span_time, gender) %>%
+    summarise(total_n = sum(n, na.rm = TRUE), .groups = "drop") %>%
+    spread(gender, total_n, fill = 0) 
+  if(perc) {
+    data%>%
+    mutate(
+      total = `1` + `2`,
+      male_percent = (`2` / total) * 100,
+      female_percent = (`1` / total) * 100
+    ) %>%
+    select(span_time, male_percent, female_percent)
+  } else {
+    data %>% select(span_time, "Maschi" = `2`, "Femmine" = `1`)
+  }
+}
+```
+
+```{r "operazioni preliminari", echo = FALSE}
+movies = read.csv("data/movies.csv") %>%
+  select(-overview, -homepage, -keywords, -overview, -status, -tagline, -original_title) %>%
+  mutate(data = as.Date(release_date, format = "%Y-%m-%d"))
+
+production_companies = movies %>%
+  rename("movie_id" = id) %>%
+  filter(map_lgl(production_companies, ~ is.data.frame(fromJSON(.)))) %>%
+  mutate(parsed = map(production_companies, ~ fromJSON(.))) %>% 
+  unnest(parsed) %>% 
+  select(movie_id, "prod_comp_id" = id, name)
+
+# divido la tabella dei credits per suddividere la partecipazioni del cast e della crew  
+credits_cast = read.csv("data/credits.csv") %>%
+  filter(map_lgl(cast, ~ is.data.frame(fromJSON(.)))) %>% 
+  mutate(parsed = map(cast, ~ fromJSON(.))) %>% 
+  unnest(parsed) %>%
+  select(-cast, -credit_id, -crew, -character)
+
+credits_crew = read.csv("data/credits.csv") %>%
+  filter(map_lgl(crew, ~ is.data.frame(fromJSON(.)))) %>%
+  mutate(parsed = map(crew, ~ fromJSON(.))) %>% 
+  unnest(parsed) %>%
+  select(-cast, -credit_id, -crew)
+
+min_n_vote = 20
+```
+
+<img src="img/wallpaper.jpeg" width="100%" align="middle">
+
+## Cosa vedremo oggi 
+
+- Introduzione
+- Analisi esplorativa
+- Grafo degli attori
+- Grafo delle case produttrici
+- Conclusioni
+
+# Introduzione
+
+## Fonte dei dati
+Il dataset che andrò ad utilizzare riguarda un insieme di quasi 5000 film
+catalogati sul portale **TMDB** (The Movie Database).
+
+<div style="text-align: center;">
+  <img src="img/logo.jpg" width="30%">
+</div>
+
+## Motivazioni
+Ho scelto questo dataset perché:
+
+- i film coprono un ampio intervallo temporale,
+- tutti gli attori, case produttrici e i membri del cast sono identificati univocamente,
+- la fonte dei dati è un portale molto affidabile.
+
+# Analisi esplorativa
+
+## Gradimento del pubblico
+
+_"I film considerati migliori dal pubblico sono anche quelli piu popolari tra esso?"_
+
+__Nota__: per popolarità si intende una misura che considera diversi parametri
+di interazione degli utenti con un film sul portale
+(ad esempio votazioni, visite della pagina, gradimento, ecc...).
+
+__Nota__: affinchè le medie dei voti risultino significative, ho considerato 
+solo i film che hanno ricevuto almeno 20 voti.
+
+## I "migliori"
+
+```{r "top10 film media voti", echo = FALSE}
+
+top10_vote_movies = movies %>%
+  filter(vote_count >= min_n_vote) %>%
+  arrange(-vote_average) %>%
+  select("Titolo" = title, "Media voti" = vote_average) %>%
+  head(10)
+
+kable(top10_vote_movies, format = "html", align = c("l", "r"))
+```
+
+## I più popolari
+
+```{r "top10 film popolarità", echo = FALSE}
+
+top10_pop_movies = movies %>%
+  arrange(-popularity) %>%
+  select("Titolo" = title, "Popolarità" = popularity) %>%
+  head(10)
+
+kable(top10_pop_movies, format = "html", align = c("l", "r"))
+```
+
+## Popolarità vs media dei voti
+
+Il primo film che compare in entrambe le classifiche è:
+
+```{r "Popolarità vs media", echo = FALSE}
+votes = movies %>%
+  filter(vote_count >= min_n_vote) %>%
+  arrange(-vote_average) 
+
+pop = movies %>%
+  arrange(-popularity) 
+
+index = 0
+title = ""
+
+for(i in 1:min(length(pop), length(movies))) {
+  votes_head = votes %>% head(i) %>% select(id)
+  pop_head = pop %>% head(i) %>% select(id)
+  commons = intersect(votes_head$id, pop_head$id)
+  if(length(commons) > 0) {
+    index = i
+    title = movies %>% filter(id == commons[1]) %>% select(title) %>% pull()
+    break
+  } 
+}
+cat(title)
+```
+prendendo in considerazione 13 film per classifica. Inoltre,
+
+```{r "Popolarità vs media 2", echo = FALSE}
+votes_1000 = votes %>% head(1000) %>% select(id)
+pop_1000 = pop %>% head(1000) %>% select(id)
+commons = intersect(votes_1000$id, pop_1000$id)
+res = length(commons) /10
+glue("solo il {res}% dei primi 1000 film")
+```
+si trova in entrmabe le classifiche.
+
+## Popolarità vs media dei voti
+
+```{r "Popolarità vs media 3", echo = FALSE}
+
+pop_vote_movies = movies %>%
+  filter(vote_count >= min_n_vote) %>%
+  filter(popularity > 0.005) %>%
+  select("Media voti" = vote_average, "Popolarità (log)" = popularity) 
+
+ggplot(pop_vote_movies, aes(x = `Popolarità (log)`, y = `Media voti`)) +
+  geom_point(alpha = 0.2, color = "black") +
+  geom_smooth(method = "lm", se = FALSE, formula = y ~ x, color = "red") + 
+  scale_x_log10() +
+  theme_minimal()
+
+correlation_value = cor(pop_vote_movies$"Popolarità (log)", pop_vote_movies$"Media voti") %>% round(3)
+
+glue("Il coefficiente di correlazione è: {correlation_value}")
+
+```
+
+## Durata dei film 
+
+ _"La durata dei film è cambiata nel tempo?"_
+
+<div style="text-align: center;">
+  <img src="img/time.jpg" width="30%">
+</div>
+
+## Durata dei film per decennio
+
+```{r "durata per decennio", echo = FALSE}
+movies_5_years = movies %>%
+  filter(runtime > 0 & release_date != "") %>%
+  mutate(anno = format(as.Date(release_date), "%Y"),
+         decennio = floor(as.numeric(anno) / 10) * 10) %>%
+  group_by(decennio) %>%
+  summarise("Durata media" = mean(runtime), 
+            "Numero film" = n())
+
+ggplot(movies_5_years, aes(x = as.factor(decennio), y = `Durata media`, fill = `Numero film`)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_gradient(low = "blue", high = "red") + 
+  labs(x = "Decennio", y = "Durata media (m)", fill = "Numero film") +
+  theme_minimal()
+```
+
+## Differenza di genere
+
+_"Nel mondo del cinema, ci sono differenze tra il numero di uomini e di donne_
+_che vi lavorano?"_
+
+__Nota__: il dataset conteneva attori senza il genere specificato. Per questa
+e le successive analisi, non li prenderò in considerazione.
+
+## Genere degli attori nei film
+
+```{r "Gender percentage cast", echo = FALSE}
+n_cast_gender_movie <- gender_for_year(credits_cast, 5, TRUE)
+
+plot_data <- n_cast_gender_movie %>%
+  pivot_longer(cols = c(male_percent, female_percent), names_to = "Genere", values_to = "percent") %>%
+  mutate(gender = recode(Genere, "male_percent" = "Maschi", "female_percent" = "Femmine"))
+
+ggplot(plot_data, aes(x = factor(span_time), y = percent, fill = gender)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("Maschi" = my_azure, "Femmine" = my_pink)) +
+  labs(x = "Periodo di riferimento", y = "Genere degli attori (%)", fill = "Genere") +
+  theme_minimal()
+```
+
+## Genere dei lavoratori nei film
+
+```{r "Gender percentage crew", echo = FALSE}
+n_crew_gender_movie <- gender_for_year(credits_crew, 5, TRUE)
+
+plot_data <- n_crew_gender_movie %>%
+  pivot_longer(cols = c(male_percent, female_percent), names_to = "Genere", values_to = "percent") %>%
+  mutate(gender = recode(Genere, "male_percent" = "Maschi", "female_percent" = "Femmine"))
+
+ggplot(plot_data, aes(x = factor(span_time), y = percent, fill = gender)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("Maschi" = my_azure, "Femmine" = my_pink)) +
+  labs(x = "Periodo di riferimento", y = "Genere dei lavoratori(%)", fill = "Genere") +
+  theme_minimal()
+```
+
+## Regia
+
+_"E per quanto riguarda i registi?"_
+
+<div style="text-align: center;">
+  <img src="img/femaleDirectors.png" width="50%">
+</div>
+
+## Numero di registi per genere
+
+```{r "Gender percentage director", echo = FALSE}
+crew_director_gender <- credits_crew %>%
+  filter(job == "Director" & gender != 0) %>%
+  distinct(id, gender) %>%
+  group_by(gender) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(
+    gender_label = recode(gender, `1` = "Femmine", `2` = "Maschi"),
+    percentage = (count / sum(count)) * 100,
+    label = paste0(round(percentage, 1), "%"),
+  )
+
+ggplot(crew_director_gender, aes(x = "", y = count, fill = gender_label)) +
+  geom_bar(stat = "identity", width = 1, show.legend = TRUE) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c("Maschi" = my_azure, "Femmine" = my_pink)) +
+  labs(fill = "Genere") +
+  theme_void() +
+  geom_text(
+    position = position_stack(vjust = 0.5, reverse = FALSE), 
+    aes(label = label), 
+    color = "white", 
+    size = 5)
+```
+
+## Numero di film per genere del regista
+
+```{r "Gender percentage director over time", echo = FALSE}
+
+n_crew_gender_movie <- gender_for_year(credits_crew %>% filter(job == "Director"), 1, FALSE)
+
+data_long <- n_crew_gender_movie %>%
+  pivot_longer(cols = c(Maschi, Femmine), names_to = "gender", values_to = "value")
+
+ggplot(data_long, aes(x = span_time, y = value, color = gender, group = gender)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 1.5) +       
+  labs(
+    x = "Anno di uscita",
+    y = "Numero di film",
+    color = "Genere"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+```
+
+## Il genere del regista influenza gli attori?
+
+```{r "Actress in film with female director", echo = FALSE}
+
+temp <- credits_crew %>%
+  filter(job == "Director") %>%
+  filter(gender != 0) %>%
+  count(movie_id, gender) %>%
+  inner_join(credits_cast, by = "movie_id", suffix = c(".director", ".cast"), relationship = "many-to-many") %>%
+  filter(gender.cast != 0) %>%
+  count(gender.director, gender.cast, movie_id) %>%
+  spread(key = gender.cast, value = n, fill = 0) %>%
+  mutate(female_percent = (`1` / (`1` + `2`)) * 100) %>%
+  group_by(movie_id) %>%
+  mutate(gender.director = if_else(n() > 1, 3, first(gender.director))) %>%
+  ungroup() %>%
+  group_by(gender.director) %>%
+  summarize(mean_perc = mean(female_percent, na.rm = TRUE)) %>%
+  mutate(gender.director = case_when(
+    gender.director == 1 ~ "Femmine",
+    gender.director == 2 ~ "Maschi",
+    gender.director == 3 ~ "Più registi",
+    TRUE ~ "unknown"
+  ))
+
+ggplot(temp, aes(x = gender.director, y = mean_perc, fill = gender.director)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  labs(
+    x = "Genere del regista",
+    y = "Media attrici (%)"
+  ) +
+  scale_fill_manual(values = c("Maschi" = my_azure, "Femmine" = my_pink, "Più registi" = "grey")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+
+```
+
+# Grafo degli attori
+
+## Introduzione
+
+Il primo grafo costruito rappresenta le collaborazioni tra diversi attori nel 
+mondo del cinema. Ogni nodo corrisponde a un attore, mentre ogni arco (indiretto) 
+indica che i due attori hanno collaborato in uno o più film. Il peso dell'arco 
+rappresenta il numero di film in cui i due attori hanno lavorato insieme.
+
+__Nota__: per evitare che il grafo diventi troppo grande, sono stati considerati 
+solo i collegamenti tra attori che abbiano lavorato insieme in film successivi 
+al 1990.
+
+```{r "initialize graph", echo = FALSE}
+
+# DECOMMENTARE nel caso in cui non sia presente il file
+
+# temp = credits_cast %>% 
+#  inner_join(movies, by = c("movie_id" = "id")) %>%
+#  filter(release_date > 1990) %>%
+#  distinct(id, name, gender, movie_id) %>%
+#  filter(id!= 1189293 & gender != 0)  # elimino l'unico nodo con doppio genere 1189293
+
+# v_a = temp %>% distinct(id, name, gender) %>% mutate("ident" = id)
+
+# couples_af = temp %>% distinct(id, movie_id)
+# e_aa = couples_af %>%
+#   inner_join(couples_af, by = "movie_id", relationship = "many-to-many") %>%
+#   filter(id.x < id.y) %>%
+#   group_by(id.x, id.y) %>%
+#   summarise(common_movies = n_distinct(movie_id), .groups = "drop") %>%
+#   rename(actor1 = id.x, actor2 = id.y)
+
+# gaa <- graph_from_data_frame(e_aa, directed = FALSE, vertices = v_a)
+# write_graph(gaa, file="data/gaa.xml", format="graphml")
+
+gaa = read_graph(file="data/gaa.xml", format="graphml")
+```
+
+## Caratteristiche
+
+```{r "graph statistics", echo = FALSE}
+n_v = vcount(gaa)
+n_e = ecount(gaa)
+glue("Il grafo è formato da {n_v} nodi (attori) e da {n_e} archi.")
+```
+Non è connesso. Possiamo inoltre notare che:
+```{r "graph statistics2", echo = FALSE}
+# verifico che sia connesso
+# is_connected(gaa) # --> FALSE
+
+#analizzo la componente gigante
+comps <- components(gaa)
+gccaa <- induced_subgraph(gaa, comps$membership == which.max(comps$csize))
+n_largest <- max(comps$csize)
+percent_n_largest <- round((n_largest / n_v) * 100, 2)
+glue("la componente gigante è formata da {n_largest} nodi, 
+     che equivalgono al {percent_n_largest} % dei nodi totali.")
+```
+
+Lavoriamo dunque con la componente gigante.
+
+```{r "graph statistics3", echo = FALSE}
+
+# misura il diametro della rete e verifica dunque se si tratta di una rete scale free 
+diam = diameter(gccaa, directed = FALSE, unconnected = FALSE, weights = NULL)
+glue("Il diametro del grafo è pari a {diam} nodi.")
+
+# calcolo la transitività
+transitivity_gaa = round(transitivity(gccaa, type = "global"), 3)
+glue("La transitività del grafo è pari a: {transitivity_gaa}.")
+
+```
+
+## Distribuzione di grado
+
+```{r "grade distribution 1", echo = FALSE}
+degree_freq_df <- as.data.frame(table(degree(gccaa)))
+
+names(degree_freq_df) <- c("degree", "frequency")
+degree_freq_df$degree <- as.numeric(as.character(degree_freq_df$degree))
+degree_freq_df$frequency <- as.numeric(as.character(degree_freq_df$frequency))
+
+ggplot(degree_freq_df, aes(x = degree, y = frequency)) +
+  geom_point(color = "red") +
+  theme_minimal() +
+  labs(x = "Grado", y = "Frequenza") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+mean_degree = trunc(mean(degree(gccaa)) * 1000) / 1000
+glue("Il grado medio è: {mean_degree}")
+```
+
+## Distribuzione di grado (log - log)
+
+```{r "grade distribution 2", echo = FALSE}
+ggplot(degree_freq_df, aes(x = degree, y = frequency)) +
+  geom_point(color = "red") + 
+  theme_minimal() +
+  labs(x = "Grado (log)", y = "Frequenza (log)") +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Non si tratta di una power-law.
+
+## Considerazioni
+
+Il grafo è ancora molto grande. 
+
+Vediamo cosa succede andando tagliare gli archi che rappresentano poche 
+collazborazioni mantenendo solo i gruppi di attori che hannno lavorato maggiornente assieme.
+
+## Considerazioni
+
+```{r "edit graph 1", echo = FALSE}
+
+reduced_graph = gccaa
+results <- data.frame(
+  index = 1,
+  n_vert = vcount(reduced_graph),
+  mean_degree = trunc(mean(degree(reduced_graph)) * 1000) / 1000,
+  comps = length(components(gaa)$csize),
+  dim_gc = max(components(reduced_graph)$csize),
+  transitivity = round(transitivity(reduced_graph, type = "global"), 3)
+)
+
+for(i in 2:12) {
+  reduced_graph = delete_edges(reduced_graph, E(reduced_graph)[common_movies < i])
+  isolated <- V(reduced_graph)[degree(reduced_graph) == 0]
+  reduced_graph = delete_vertices(reduced_graph, isolated)
+  comps = components(reduced_graph)
+  
+  if(i == 5) medium_graph = reduced_graph
+  if(i == 7) small_graph = reduced_graph
+
+  results <- rbind(
+    results,
+    data.frame(
+      index = i,
+      n_vert = vcount(reduced_graph),
+      mean_degree = trunc(mean(degree(reduced_graph)) * 1000) / 1000,
+      comps = length(comps$csize),
+      dim_gc = max(comps$csize),
+      transitivity = round(transitivity(reduced_graph, type = "global"), 3)
+    )
+  )
+}
+
+results = rename(results, "Peso" = index, "Numero nodi" = n_vert,
+                 "Grado medio" = mean_degree, "Numero componenti" = comps, 
+                 "Dimensioni max componente" = dim_gc, "Transitività" = transitivity)
+
+kable(results, format = "html", align = c("c", "c", "c", "c", "c"))
+
+```
+
+## Almeno cinque collaborazioni
+
+```{r "more than 5 movies", echo = FALSE}
+suppressWarnings({
+
+  img = ggraph(medium_graph, layout = "igraph", algorithm = "fr") +
+    geom_edge_link(aes(color = "gray"), alpha = 1) + 
+    geom_node_point(aes(color = factor(gender)), size = 2) +  
+    scale_color_manual(values = c("2" = my_azure, "1" = my_pink)) +
+    theme_void() +
+    theme(legend.position = "none")
+  print(img)
+})
+
+```
+
+## Almeno sette collaborazioni
+
+```{r "more than 7 movies", echo = FALSE}
+suppressWarnings({
+  img = ggraph(small_graph, layout = "igraph", algorithm = "fr") +
+    geom_edge_link(aes(color = "gray"), alpha = 1, size = 10) + 
+    geom_node_point(aes(color = factor(gender)), size = 5) +  
+    scale_color_manual(values = c("2" = my_azure, "1" = my_pink)) +
+    geom_node_text(aes(label = name), vjust = 2.8, size = 3) +  
+    theme_void() +
+    theme(legend.position = "none")
+  print(img)
+})
+
+```
+
+## Attori che hanno fatto più film
+
+```{r "Most films for actor", echo = FALSE}
+more_film_for_actor = credits_cast %>%
+  count(id, name) %>%
+  arrange(-n) %>%
+  select(id, "Attore" = name, "Apparizioni" = n) %>%
+  head(10)
+
+kable(more_film_for_actor %>% select(Attore, Apparizioni), 
+      format = "html", 
+      align = c("l", "r"))
+```
+
+## Incassi dei film
+
+In genere, un film viene considerato un flop quando non recupera il budget 
+investito nella sua produzione. Al contrario, un film viene definito un successo 
+quando incassa almeno una volta e mezza l'importo del budget speso.
+
+## Flop e Top
+
+Alcuni casi eclatanti:
+
+```{r "flop movies", echo = FALSE}
+# 0 is a flop, 1 is not that bad, 2 is a success
+flop_film = movies %>%
+  filter(revenue != 0 & budget != 0) %>%
+  mutate(success = if_else(revenue < budget, 0, if_else(revenue > (budget * 1.5), 2, 1)),
+         diff = revenue - budget) %>%
+  select("movie_id" = id, title, success, diff, popularity)
+
+bot3 = flop_film %>%
+  filter(success == 0) %>%
+  arrange(diff) %>%
+  select("Titolo" =title, "Perdita ($)" = diff) %>%
+  head(3)
+
+kable(bot3, format = "html", align = c("l", "r")) %>%
+  kable_styling(full_width = TRUE)
+
+top3 = flop_film %>%
+  filter(success == 2) %>%
+  arrange(-diff) %>%
+  select("Titolo" =title, "Guadagno ($)" = diff) %>%
+  head(3)
+
+kable(top3, format = "html", align = c("l", "r")) %>%
+  kable_styling(full_width = TRUE)
+
+```
+
+## Centralità
+
+_Possiamo utilizzare delle misure di centralità come indice per capire la_
+_popolarità e il guadagno di un film in base agli attori che vi partcipano?_
+
+Di seguito la tabella delle correlazioni.
+
+```{r "good movie by actors", echo = FALSE}
+  # CLOSENESSS - DECOMMENTARE nel caso in cui non sia presente il file
+  #closeness_centrality <- closeness(gccaa, mode = "all", normalized = TRUE)
+  # closeness_df <- data.frame(
+  #  id = V(gccaa)$ident,    
+  #  name = V(gccaa)$name,                 
+  #  closeness = closeness_centrality 
+  #)
+  #saveRDS(closeness_df, "data/closeness_centrality.rds")
+
+  closeness_df = readRDS("data/closeness_centrality.rds")
+  
+  # DEGREE
+  degree_df <- data.frame(
+    id = V(gccaa)$ident,    
+    name = V(gccaa)$name, 
+    degree = degree(gccaa)
+  )
+  # BETWEENNESS - DECOMMENTARE nel caso in cui non sia presente il file
+  #betweenness_centrality <- betweenness(gccaa, cutoff = 3, directed = FALSE)
+  #betweenness_df <- data.frame(
+  #  id = V(gccaa)$ident,    
+  #  name = V(gccaa)$name,                 
+  #  betweenness = betweenness_centrality 
+  #)
+  #saveRDS(betweenness_df, "data/betweenness_centrality.rds")
+  
+  betweenness_df = readRDS("data/betweenness_centrality.rds")
+    
+  centrality_actor = closeness_df %>%
+    inner_join(credits_cast%>% distinct(name,id), 
+               by = "name", relationship = "many-to-many") %>%
+    inner_join(betweenness_df, by = "name", relationship = "many-to-many" ) %>%
+    inner_join(degree_df, by = "name", relationship = "many-to-many" ) %>%
+    inner_join(closeness_df, by = "name", relationship = "many-to-many" ) %>%
+    select(-name)
+
+  pop_diff_centrality = flop_film %>% 
+    inner_join(credits_cast, by = "movie_id") %>%
+    inner_join(centrality_actor, by = c("id" = "id.y"), relationship = "many-to-many") %>%
+    mutate(closeness = as.numeric(closeness.x),
+           betweenness = as.numeric(betweenness),
+           popularity = as.numeric(popularity)) %>%
+    rename(title = title.x) %>%
+    group_by(movie_id, title, diff, popularity) %>%
+    summarize(mean_closeness = mean(closeness, na.rm = TRUE), 
+              mean_degree = mean(degree, na.rm = TRUE),
+              mean_betweenness = mean(betweenness, na.rm = TRUE), .groups = "drop") %>%
+    filter(!is.na(popularity) & !is.na(mean_closeness))
+  
+  # scarsa correlazione per tutte
+  cor_pc_mc = cor(pop_diff_centrality$popularity, pop_diff_centrality$mean_closeness)
+  cor_dc_mc = cor(pop_diff_centrality$diff, pop_diff_centrality$mean_closeness)
+  
+  cor_pc_md = cor(pop_diff_centrality$popularity, pop_diff_centrality$mean_degree)
+  cor_dc_md = cor(pop_diff_centrality$diff, pop_diff_centrality$mean_degree)
+  
+  cor_pc_mb = cor(pop_diff_centrality$popularity, pop_diff_centrality$mean_betweenness)
+  cor_dc_mb = cor(pop_diff_centrality$diff, pop_diff_centrality$mean_betweenness)
+  
+  # Creazione della tabella
+  cor_table = data.frame(
+    Metodo = c("Degree", "Closeness", "Betweenness"),
+    "Guadagno" = c(cor_dc_md, cor_dc_mc, cor_dc_mb),
+    "Popolarità" = c(cor_pc_md, cor_pc_mc, cor_pc_mb)
+  )
+  
+  kable(cor_table, format = "html", align = c("l", "c")) %>%
+    kable_styling(full_width = TRUE)
+```
+    
+## Centralità media vs popolarità
+
+```{r "degree pop dif", echo = FALSE}
+
+pop_deg = ggplot(pop_diff_centrality, aes(x = popularity, y = mean_degree)) +
+    geom_point(color = "black", size = 2, alpha = 0.3) +
+    scale_x_log10() +
+    labs( x = "Popolarità (log)", y = "Grado medio") +
+    theme_minimal()
+
+pop_bet = ggplot(pop_diff_centrality, aes(x = popularity, y = mean_closeness)) +
+  geom_point(color = "black", size = 2, alpha = 0.3) +
+  scale_x_log10() +
+  labs( x = "Popolarità (log)", y = "Closeness media") +
+  theme_minimal()
+
+pop_clo = ggplot(pop_diff_centrality, aes(x = popularity, y = mean_degree)) +
+  geom_point(color = "black", size = 2, alpha = 0.3) +
+  scale_x_log10() +
+  labs( x = "Popolarità (log)", y = "Betweenness media") +
+  theme_minimal()
+
+grid.arrange(pop_deg, pop_bet, pop_clo, ncol = 3)
+
+```
+
+# Grafo delle case cinematografiche
+
+## Introduzione
+
+Il secondo grafo rappresenta la relazione tra le case cinematografiche e la 
+loro produzione di film. Ogni arco indica una collaborazione tra due case, e il 
+peso degli archi corrisponde al numero di film prodotti insieme.
+
+__Nota__: Ho deciso di concentrarmi principalmente sulle case cinematografiche 
+più produttive, mantenendo solo quelle che hanno prodotto almeno 10 film e le 
+collaborazioni durature, ossia quelle con almeno 3 film realizzati insieme.
+
+```{r "initialize graph 2", echo = FALSE}
+
+movie_for_pc = production_companies %>%
+  count(prod_comp_id) %>%
+  filter(n > 10)
+
+pc = production_companies %>% 
+  inner_join(movie_for_pc, by = "prod_comp_id", suffix = c(".todelete", ""))
+
+v_pc = pc %>% distinct(prod_comp_id, name)
+
+couples_pc = pc %>% 
+  distinct(prod_comp_id, movie_id) %>% 
+  inner_join(flop_film, by = "movie_id") %>%
+  select(-success)
+
+e_pc = couples_pc %>%
+ inner_join(couples_pc, by = "movie_id", relationship = "many-to-many") %>%
+ filter(prod_comp_id.x < prod_comp_id.y) %>%
+ group_by(prod_comp_id.x, prod_comp_id.y) %>%
+ summarise(
+   common_movies = n_distinct(movie_id),
+   mean_popularity = mean(popularity.x, na.rm = TRUE),
+   mean_diff = mean(diff.x, na.rm = TRUE),
+   .groups = "drop"
+ ) %>%
+ rename(pc1 = prod_comp_id.x, pc2 = prod_comp_id.y) %>%
+ filter(common_movies > 3)
+
+gpc <- graph_from_data_frame(e_pc, directed = FALSE, vertices = v_pc)
+
+```
+
+## Caratteristiche
+
+```{r "graph statistics a", echo = FALSE}
+n_v_pc = vcount(gpc)
+n_e_pc = ecount(gpc)
+glue("Il grafo è formato da {n_v_pc} nodi (case produttrici) e da {n_e_pc} archi.")
+```
+Non è connesso. Possiamo inoltre notare che:
+```{r "graph statistics2 a", echo = FALSE}
+# verifico che sia connesso
+# is_connected(gaa) # --> FALSE
+
+#analizzo la componente gigante
+comps <- components(gpc)
+gccpc <- induced_subgraph(gpc, comps$membership == which.max(comps$csize))
+n_largest <- max(comps$csize)
+percent_n_largest <- round((n_largest / n_v_pc) * 100, 2)
+glue("la componente gigante è formata da {n_largest} nodi, 
+     che equivalgono al {percent_n_largest} % dei nodi totali.")
+```
+Lavoriamo dunque con la componente gigante.
+
+```{r "graph statistics3 a", echo = FALSE}
+
+# misura il diametro della rete e verifica dunque se si tratta di una rete scale free 
+diam = diameter(gccpc, directed = FALSE, unconnected = FALSE, weights = NULL)
+glue("Il diametro del grafo è pari a {diam} nodi.")
+
+# calcolo la transitività
+transitivity_gaa = round(transitivity(gccpc, type = "global"), 3)
+glue("La transitività del grafo è pari a: {transitivity_gaa}.")
+
+```
+
+## La componente gigante
+
+```{r "plot graph a", echo = FALSE}
+
+suppressWarnings({
+  img = ggraph(gccpc, layout = "igraph", algorithm = "kk") +
+    geom_edge_link(aes(width = mean_popularity), color = "blue", alpha = 0.7) +  
+    geom_node_point(aes(color = "blue"), size = 5, shape = 16,  color = "darkblue") +  
+    scale_edge_width(range = c(0.5, 5)) + 
+    theme_void() +
+    theme(legend.position = "none", 
+          plot.margin = unit(c(1,1,1,1), "cm"))
+  print(img)
+})
+
+```
+
+## Distribuzione di grado
+
+```{r "grade distribution a", echo = FALSE}
+degree_freq_df <- as.data.frame(table(degree(gccpc)))
+
+names(degree_freq_df) <- c("degree", "frequency")
+degree_freq_df$degree <- as.numeric(as.character(degree_freq_df$degree))
+degree_freq_df$frequency <- as.numeric(as.character(degree_freq_df$frequency))
+
+ggplot(degree_freq_df, aes(x = degree, y = frequency)) +
+  geom_bar(stat = "identity", color = "darkblue", fill = "blue") +
+  labs(x = "Grado", y = "Frequenza") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+mean_degree = trunc(mean(degree(gccpc)) * 1000) / 1000
+glue("Il grado medio è pari a {mean_degree}.")
+```
+
+## Divisione in comunità
+
+_Le case di produzione possono essere catalogate in diverse comunità?_
+_Riusciamo a trovare qualche caratteristica significativa all'interno di esse?_
+
+Osserviamo i risultati di 3 algoritmi.
+
+## Algoritmo Fast Greedy
+
+```{r "community1", echo = FALSE}
+
+communities = cluster_fast_greedy(gccpc)
+modularity_value <- modularity(communities)
+V(gccpc)$community <- membership(communities)
+
+img = ggraph(gccpc, layout = "igraph", algorithm = "fr") +
+    geom_edge_link(color = "gray", alpha = 0.5) +  
+    geom_node_point(aes(color = factor(community)), size = 5) + 
+    theme_void() +
+    theme(legend.position = "right") +  
+    scale_color_discrete(name = "Comunità") 
+print(img)
+    
+modularity = round(modularity(communities), 3)
+
+
+glue("Il valore di modularità applicando fast greedy è {modularity}")
+
+```
+
+## Algoritmo Edge Betweenness
+
+```{r "community2", echo = FALSE}
+
+communities = cluster_edge_betweenness(gccpc)
+modularity_value <- modularity(communities)
+V(gccpc)$community <- membership(communities)
+
+img = ggraph(gccpc, layout = "igraph", algorithm = "fr") +
+    geom_edge_link(color = "gray", alpha = 0.5) +  
+    geom_node_point(aes(color = factor(community)), size = 5) + 
+    theme_void() +
+    theme(legend.position = "right") +  
+    scale_color_discrete(name = "Comunità")
+print(img)
+    
+modularity = round(modularity(communities), 3)
+
+glue("Il valore di modularità applicando edge betweenneess è {modularity}")
+
+```
+
+## Algoritmo Label Propagation
+
+```{r "community3", echo = FALSE}
+
+communities = cluster_label_prop(gccpc)
+modularity_value <- modularity(communities)
+V(gccpc)$community <- membership(communities)
+
+img = ggraph(gccpc, layout = "igraph", algorithm = "fr") +
+    geom_edge_link(color = "gray", alpha = 0.5) +  
+    geom_node_point(aes(color = factor(community)), size = 5) + 
+    theme_void() +
+    theme(legend.position = "right") +  
+    scale_color_discrete(name = "Comunità")  
+print(img)
+    
+modularity = round(modularity(communities), 3)
+
+glue("Il valore di modularità applicando label propagation è {modularity}")
+
+```
+
+## Analisi delle categorie
+
+Ho deciso di scegliere il metodo Edge Betweenness, in quanto garantiva il 
+miglior livello di modularità. 
+
+Di seguito, analizzo le categorie.
+
+```{r "edge betwenness", echo = FALSE}
+communities = cluster_edge_betweenness(gccpc)
+V(gccpc)$community <- membership(communities)
+node_names <- V(gccpc)$name
+nodes_by_community <- split(node_names, V(gccpc)$community)
+```
+
+## Americano, Inglese, Neozelandese
+
+```{r "americani 5", echo = FALSE}
+i = 4
+  list = nodes_by_community[[i]] 
+  cat(list[1:6], sep = "\n")
+  string <- paste(names(list), unlist(list), sep=" ", collapse="|")
+
+  glue("\n Nella comunità {i} sono presenti {length(nodes_by_community[[i]])} nodi.")
+
+  names = data.frame("name" = nodes_by_community[[i]])
+  vv = v_pc %>% inner_join(names, by = "name")
+  e = e_pc %>% 
+    inner_join(vv, by = c("pc1" = "prod_comp_id")) %>%
+    inner_join(vv, by = c("pc2" = "prod_comp_id"))
+  sum_e = sum(e$common_movies)
+  glue("\n Dalla loro collaborazione sono stati creati {sum_e} film.")
+```
+
+## Varie società Americane 
+
+```{r "americani 6", echo = FALSE}
+i = 5
+  list = nodes_by_community[[i]] 
+  cat(list[1:10], sep = "\n")
+  string <- paste(names(list), unlist(list), sep=" ", collapse="|")
+
+  glue("\n Nella comunità {i} sono presenti {length(nodes_by_community[[i]])} nodi.")
+
+  names = data.frame("name" = nodes_by_community[[i]])
+  vv = v_pc %>% inner_join(names, by = "name")
+  e = e_pc %>% 
+    inner_join(vv, by = c("pc1" = "prod_comp_id")) %>%
+    inner_join(vv, by = c("pc2" = "prod_comp_id"))
+  sum_e = sum(e$common_movies)
+  glue("\n Dalla loro collaborazione sono stati creati {sum_e} film.")
+```
+
+## Animazione e colossal
+
+```{r "animazione", echo = FALSE}
+  i = 2
+  list = nodes_by_community[[i]] 
+  cat(list[1:5], sep = "\n")
+  cat("... \n")
+  string <- paste(names(list), unlist(list), sep=" ", collapse="|")
+
+  glue("\n Nella comunità {i} sono presenti {length(nodes_by_community[[i]])} nodi.")
+
+  names = data.frame("name" = nodes_by_community[[i]])
+  vv = v_pc %>% inner_join(names, by = "name")
+  e = e_pc %>% 
+    inner_join(vv, by = c("pc1" = "prod_comp_id")) %>%
+    inner_join(vv, by = c("pc2" = "prod_comp_id"))
+  sum_e = sum(e$common_movies)
+  glue("\n Dalla loro collaborazione sono stati creati {sum_e} film.")
+  
+```
+
+## Studi europei
+
+```{r "europei", echo = FALSE}
+i =7
+  list = nodes_by_community[[i]] 
+  cat(list[1:4], sep = "\n")
+  string <- paste(names(list), unlist(list), sep=" ", collapse="|")
+
+  glue("\n Nella comunità {i} sono presenti {length(nodes_by_community[[i]])} nodi.")
+
+  names = data.frame("name" = nodes_by_community[[i]])
+  vv = v_pc %>% inner_join(names, by = "name")
+  e = e_pc %>% 
+    inner_join(vv, by = c("pc1" = "prod_comp_id")) %>%
+    inner_join(vv, by = c("pc2" = "prod_comp_id"))
+  sum_e = sum(e$common_movies)
+  glue("\n Dalla loro collaborazione sono stati creati {sum_e} film.")
+  
+  
+```
+
+## Colossi Americani, Marvel
+
+```{r "americani", echo = FALSE}
+  i = 1
+  list = nodes_by_community[[i]] 
+  cat(list[1:5], sep = "\n")
+  cat("... \n")
+  string <- paste(names(list), unlist(list), sep=" ", collapse="|")
+
+  glue("\n Nella comunità {i} sono presenti {length(nodes_by_community[[i]])} nodi.")
+
+  names = data.frame("name" = nodes_by_community[[i]])
+  vv = v_pc %>% inner_join(names, by = "name")
+  e = e_pc %>% 
+    inner_join(vv, by = c("pc1" = "prod_comp_id")) %>%
+    inner_join(vv, by = c("pc2" = "prod_comp_id"))
+  sum_e = sum(e$common_movies)
+  glue("\n Dalla loro collaborazione sono stati creati {sum_e} film.")
+```
+
+## Colossi Americani, DC
+
+```{r "americani 2", echo = FALSE}
+  i = 3
+  list = nodes_by_community[[i]] 
+  cat(list[1:5], sep = "\n")
+  cat("... \n")
+  string <- paste(names(list), unlist(list), sep=" ", collapse="|")
+
+  glue("\n Nella comunità {i} sono presenti {length(nodes_by_community[[i]])} nodi.")
+
+  names = data.frame("name" = nodes_by_community[[i]])
+  vv = v_pc %>% inner_join(names, by = "name")
+  e = e_pc %>% 
+    inner_join(vv, by = c("pc1" = "prod_comp_id")) %>%
+    inner_join(vv, by = c("pc2" = "prod_comp_id"))
+  sum_e = sum(e$common_movies)
+  glue("\n Dalla loro collaborazione sono stati creati {sum_e} film.")
+```
+
+## Società Americane che collaborano 
+
+```{r "americani 3", echo = FALSE}
+i = 6
+  list = nodes_by_community[[i]] 
+  cat(list[1:4], sep = "\n")
+  string <- paste(names(list), unlist(list), sep=" ", collapse="|")
+
+  glue("\n Nella comunità {i} sono presenti {length(nodes_by_community[[i]])} nodi.")
+
+  names = data.frame("name" = nodes_by_community[[i]])
+  vv = v_pc %>% inner_join(names, by = "name")
+  e = e_pc %>% 
+    inner_join(vv, by = c("pc1" = "prod_comp_id")) %>%
+    inner_join(vv, by = c("pc2" = "prod_comp_id"))
+  sum_e = sum(e$common_movies)
+  glue("\n Dalla loro collaborazione sono stati creati {sum_e} film.")
+```
+
+## Rivediamo il grafo
+
+```{r "final", echo = FALSE}
+V(gccpc)$community <- as.character(V(gccpc)$community)
+V(gccpc)$community <- gsub("1", "Colossi Americani, Marvel",V(gccpc)$community)
+V(gccpc)$community <- gsub("2", "Animazione e colossal",V(gccpc)$community)
+V(gccpc)$community <- gsub("3", "Colossi Americani, DC",V(gccpc)$community)
+V(gccpc)$community <- gsub("4", "Americano, Inglese, Neozelandese",V(gccpc)$community)
+V(gccpc)$community <- gsub("5", "Varie società Americane ",V(gccpc)$community)
+V(gccpc)$community <- gsub("6", "Società Americane che collaborano",V(gccpc)$community)
+V(gccpc)$community <- gsub("7", "Studi europei",V(gccpc)$community)
+
+img = ggraph(gccpc, layout = "igraph", algorithm = "fr") +
+    geom_edge_link(color = "gray", alpha = 0.5) +  
+    geom_node_point(aes(color = factor(community)), size = 5) + 
+    theme_void() +
+    theme(legend.position = "right") +  
+    scale_color_discrete(name = "Comunità")
+print(img)
+
+```
+
+# Conclusioni
+
+## Cosa abbiamo visto 
+
+- Analisi esplorativa
+- Grafo degli attori
+- Grafo delle case produttrici
+
+## Miglioramenti
+- sfruttare le API di TMDB per ottenere dati aggiornati,
+- calcolare metriche avanzate (modificando i grafi),
+- analizzare generi, paesi di produzione e altre informazioni.
+
+# Grazie dell'attenzione
